@@ -1,11 +1,25 @@
+# gem読み込み
 require 'discordrb'
 require 'dotenv'
+require 'pg'
+require 'sequel'
 
+# 環境変数読み込み
 Dotenv.load
 CLIENT_ID = ENV['CLIENT_ID']
 TOKEN = ENV['TOKEN']
+DB_NAME = ENV['DB_NAME']
+DB_HOST = ENV['DB_HOST']
+DB_USER = ENV['DB_USER']
+DB_PASS = ENV['DB_PASS']
+DB_PORT = ENV['DB_PORT']
 
+# botインスタンス作成
 bot = Discordrb::Bot.new(client_id: CLIENT_ID, token: TOKEN)
+
+# データベースとの接続確立
+DB = Sequel.postgres(host: DB_HOST, port: DB_PORT, dbname: DB_NAME, user: DB_USER, password: DB_PASS)
+puts DB
 
 bot.message(contains: 'test') do |event|
   req_json = {
@@ -60,7 +74,7 @@ bot.message(contains: 'test') do |event|
       }
     ]
   }
-  uri = URI.parse("https://discordapp.com/api/channels/725471441260118097/messages")
+  uri = URI.parse("https://discordapp.com/api/channels/#{event.channel.id}/messages")
   http = Net::HTTP.new(uri.host, uri.port)
   http.use_ssl = uri.scheme === 'https'
   params = req_json
