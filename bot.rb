@@ -6,6 +6,7 @@ require 'sequel'
 require 'net/http'
 require 'uri'
 require 'json'
+require 'time'
 
 # 環境変数読み込み
 Dotenv.load
@@ -33,9 +34,9 @@ end
 # クラバト日インデックス（毎日5:00区切り）
 def current_day_index
   now = jst_now
-  boundary = Time.new(now.year, now.month, now.day, 5, 0, 0, '+09:00')
-  day = now >= boundary ? now.day : (now - 60 * 60 * 24).day
-  day
+  # 5時間前の日付を取得（5:00〜4:59が1日）
+  adjusted_time = now - 5 * 60 * 60
+  adjusted_time.day
 end
 
 def channel_to_boss_number(channel_id)
@@ -53,6 +54,32 @@ end
 
 PANEL_MESSAGE_IDS = {}
 
+# パネルメッセージIDの永続化
+def save_panel_message_id(channel_id, message_id)
+  DB[:panel_messages].upsert(
+    channel_id: channel_id,
+    message_id: message_id,
+    updated_at: Time.now
+  )
+end
+
+# 起動時にパネルメッセージIDを復元
+def restore_panel_messages
+  DB[:panel_messages].each do |row|
+    PANEL_MESSAGE_IDS[row[:channel_id]] = row[:message_id]
+  end
+end
+
+def max_hp_for(boss_state)
+  # 段階レベルに応じて max_hp_lv{2,3,4} を使用
+  laps = boss_state[:laps].to_i
+  level = (boss_state[:level] || level_for_laps(laps)).to_i
+  level_key = "max_hp_lv#{level}".to_sym
+  
+  # 段階別HPを使用
+  boss_state[level_key] || 0
+end
+
 def build_panel_payload(channel_id)
   ch = channel_to_boss_number(channel_id)
   return nil unless ch
@@ -63,13 +90,14 @@ def build_panel_payload(channel_id)
   attacked_users, attacking_users = fetch_attack_status_strings(ch, laps)
   attacked_users = attacked_users.to_s
   attacking_users = attacking_users.to_s
+  max_hp = max_hp_for(boss_data)
   {
     "content": '',
     "tts": false,
     "embeds": [
       {
         "id": 652627557,
-        "title": "#{(boss_data[:name] rescue nil) || "Boss#{ch}"} #{boss_data[:now_hp]}万/#{boss_data[:max_hp]}万",
+        "title": "【#{ch}ボス】#{(boss_data[:name] rescue nil) || "ボス名未設定"} #{boss_data[:now_hp]}万/#{max_hp}万",
         "description": "**凸済み**\n#{attacked_users}\n\n**凸中**\n#{attacking_users}",
         "color": 2326507,
         "fields": [],
@@ -110,7 +138,9 @@ def post_or_update_panel(channel_id)
       resp = http.post(uri.request_uri, payload.to_json, headers)
       if resp.is_a?(Net::HTTPSuccess)
         body = JSON.parse(resp.body) rescue {}
-        PANEL_MESSAGE_IDS[channel_id] = body['id']
+        new_message_id = body['id']
+        PANEL_MESSAGE_IDS[channel_id] = new_message_id
+        save_panel_message_id(channel_id, new_message_id)
       end
     end
   else
@@ -118,8 +148,26 @@ def post_or_update_panel(channel_id)
     resp = http.post(uri.request_uri, payload.to_json, headers)
     if resp.is_a?(Net::HTTPSuccess)
       body = JSON.parse(resp.body) rescue {}
-      PANEL_MESSAGE_IDS[channel_id] = body['id']
+      new_message_id = body['id']
+      PANEL_MESSAGE_IDS[channel_id] = new_message_id
+      save_panel_message_id(channel_id, new_message_id)
     end
+  end
+end
+
+def post_new_panel(channel_id)
+  payload = build_panel_payload(channel_id)
+  return unless payload
+  http = Net::HTTP.new('discordapp.com', 443)
+  http.use_ssl = true
+  headers = { 'Content-Type' => 'application/json', 'Authorization' => "Bot #{TOKEN}" }
+  uri = URI.parse("https://discordapp.com/api/channels/#{channel_id}/messages")
+  resp = http.post(uri.request_uri, payload.to_json, headers)
+  if resp.is_a?(Net::HTTPSuccess)
+    body = JSON.parse(resp.body) rescue {}
+    new_message_id = body['id']
+    PANEL_MESSAGE_IDS[channel_id] = new_message_id
+    save_panel_message_id(channel_id, new_message_id)
   end
 end
 
@@ -127,45 +175,108 @@ def format_damage(d)
   (d || 0).to_i
 end
 
+def build_daily_status_panel
+  today = current_day_index
+  members = DB[:members].where(is_member: true).order(:discord_user_name).all
+  
+  lines = []
+  members.each do |member|
+    # a: その日の通常凸完了回数（carry_over=false の completed・killed）
+    normal_completed = DB[:attacks].where(
+      member_id: member[:id],
+      year_month: current_year_month,
+      day_index: today,
+      carry_over: false,
+      status: ['completed', 'killed']
+    ).count
+    
+    # c: その日の持ち越し凸完了回数（carry_over=true の completed・killed）
+    carry_over_completed = DB[:attacks].where(
+      member_id: member[:id],
+      year_month: current_year_month,
+      day_index: today,
+      carry_over: true,
+      status: ['completed', 'killed']
+    ).count
+    
+    # d: その日の獲得持ち越し回数（carry_over=false の killed）
+    earned_carry_over = DB[:attacks].where(
+      member_id: member[:id],
+      year_month: current_year_month,
+      day_index: today,
+      carry_over: false,
+      status: 'killed'
+    ).count
+    
+    display_name = member[:display_name] || member[:discord_user_name]
+    lines << "#{display_name}　#{normal_completed}/3　#{carry_over_completed}/#{earned_carry_over}"
+  end
+  
+  {
+    "content": '',
+    "tts": false,
+    "embeds": [
+      {
+        "title": "#{jst_now.strftime('%Y年%m月%d日')}凸状況",
+        "description": lines.join("\n"),
+        "color": 3447003,
+        "fields": [],
+        "timestamp": jst_now.iso8601
+      }
+    ]
+  }
+end
+
+def post_daily_status(channel_id)
+  payload = build_daily_status_panel
+  return unless payload
+  
+  http = Net::HTTP.new('discordapp.com', 443)
+  http.use_ssl = true
+  headers = { 'Content-Type' => 'application/json', 'Authorization' => "Bot #{TOKEN}" }
+  uri = URI.parse("https://discordapp.com/api/channels/#{channel_id}/messages")
+  resp = http.post(uri.request_uri, payload.to_json, headers)
+  resp.is_a?(Net::HTTPSuccess)
+end
+
 def fetch_attack_status_strings(boss_number, laps)
   # 凸中（宣言中）
   attacking_rows = DB[:attacks]
     .join(:members, id: :member_id)
     .where(year_month: current_year_month, boss_number: boss_number, laps_at_start: laps, status: 'declared', is_attacking: true)
-    .select(Sequel[:members][:discord_user_name].as(:name), Sequel[:attacks][:damage].as(:damage))
+    .select(Sequel[:members][:display_name].as(:display_name), Sequel[:members][:discord_user_name].as(:discord_user_name), Sequel[:attacks][:damage].as(:damage))
     .all
 
   # 凸済み（完了、討伐含む）
   attacked_rows = DB[:attacks]
     .join(:members, id: :member_id)
     .where(year_month: current_year_month, boss_number: boss_number, laps_at_start: laps, status: 'completed')
-    .select(Sequel[:members][:discord_user_name].as(:name), Sequel[:attacks][:damage].as(:damage))
+    .select(Sequel[:members][:display_name].as(:display_name), Sequel[:members][:discord_user_name].as(:discord_user_name), Sequel[:attacks][:damage].as(:damage))
     .all
 
-  attacking_str = attacking_rows.map { |r| "#{r[:name]} #{format_damage(r[:damage])}万" }.join("\n")
-  attacked_str = attacked_rows.map { |r| "#{r[:name]} #{format_damage(r[:damage])}万" }.join("\n")
+  attacking_str = attacking_rows.map { |r| "#{(r[:display_name] || r[:discord_user_name])} #{format_damage(r[:damage])}万" }.join("\n")
+  attacked_str = attacked_rows.map { |r| "#{(r[:display_name] || r[:discord_user_name])} #{format_damage(r[:damage])}万" }.join("\n")
   [attacked_str, attacking_str]
-end
-
-bot.message(contains: 'test') do |event|
-  begin
-    post_or_update_panel(event.channel.id)
-  rescue => e
-    event.respond "パネル投稿でエラーなの: #{e.class} #{e.message}"
-  end
 end
 
 # コマンド: cb_start（現在のチャンネルに凸パネルを投稿）
 bot.message(contains: 'cb_start') do |event|
   begin
-    ch = channel_to_boss_number(event.channel.id)
-    unless ch
-      event.respond 'このチャンネルはボスと紐付いていないの（channel_mappingsに登録してほしいの）'
+    rows = DB[:channel_mappings].all
+    if rows.empty?
+      event.respond 'channel_mappings が空なの（チャンネル紐付けを登録してほしいの）'
       next
     end
-    post_or_update_panel(event.channel.id)
+    posted = 0
+    rows.each do |r|
+      boss_number = r[:boss_number]
+      state = DB[:boss_states].where(year_month: current_year_month, boss_number: boss_number).first
+      next unless state
+      post_new_panel(r[:channel_id])
+      posted += 1
+    end
   rescue => e
-    event.respond "パネル投稿でエラーなの: #{e.class} #{e.message}"
+    event.respond "パネル一括投稿でエラーなの: #{e.class} #{e.message}"
   end
 end
 
@@ -187,6 +298,11 @@ bot.message do |event|
   # 入力のたび即時更新
   begin
     post_or_update_panel(event.channel.id)
+    # 凸状況パネルも更新
+    status_channel_id = ENV['STATUS_CHANNEL_ID']
+    if status_channel_id && !status_channel_id.strip.empty?
+      post_daily_status(status_channel_id.to_i)
+    end
   rescue => e
     # 失敗しても黙って続行
   end
@@ -203,7 +319,6 @@ bot.button do |event|
   begin
     # Interactionは3秒以内に応答が必要。最初に必ずdeferする
     safe_defer(event)
-    puts event.custom_id # atk/202411/1/1のような形で来る予定なのでフォーマットとバリデートする
 
     btn_id_ary = event.custom_id.split('/') # ['atk','202411','1','1']
     unless btn_id_ary.size >= 4
@@ -245,6 +360,11 @@ bot.button do |event|
           status: 'declared'
         )
         post_or_update_panel(event.channel.id)
+        # 凸状況パネルも更新
+        status_channel_id = ENV['STATUS_CHANNEL_ID']
+        if status_channel_id && !status_channel_id.strip.empty?
+          post_daily_status(status_channel_id.to_i)
+        end
       end
     end
     when 'over' # 持ち越し凸時
@@ -270,6 +390,11 @@ bot.button do |event|
           status: 'declared'
         )
         post_or_update_panel(event.channel.id)
+        # 凸状況パネルも更新
+        status_channel_id = ENV['STATUS_CHANNEL_ID']
+        if status_channel_id && !status_channel_id.strip.empty?
+          post_daily_status(status_channel_id.to_i)
+        end
       end
     end
     when 'comp' # 凸完了時
@@ -291,6 +416,11 @@ bot.button do |event|
         DB[:boss_states].where(id: state[:id]).update(now_hp: new_hp, updated_at: Time.now)
       end
       post_or_update_panel(event.channel.id)
+      # 凸状況パネルも更新
+      status_channel_id = ENV['STATUS_CHANNEL_ID']
+      if status_channel_id && !status_channel_id.strip.empty?
+        post_daily_status(status_channel_id.to_i)
+      end
     end
     when 'beat' # 討伐時
     boss_number = btn_id_ary[2].to_i
@@ -305,12 +435,18 @@ bot.button do |event|
       next
     end
 
-    # ユーザーがまだ宣言中なら完了にしてから持越しを作る
-    attacking_info = DB[:attacks].where(member_id: user[:id], is_attacking: true, status: 'declared').first
-    if attacking_info
-      DB[:attacks].where(id: attacking_info[:id]).update(
+    # ユーザーが該当ボスで宣言中なら討伐扱いにする（同一ボス・同一周回のみ対象）
+    declared_ds = DB[:attacks].where(
+      member_id: user[:id],
+      boss_number: boss_number,
+      laps_at_start: state[:laps],
+      is_attacking: true,
+      status: 'declared'
+    )
+    if declared_ds.count > 0
+      declared_ds.update(
         is_attacking: false,
-        status: 'completed',
+        status: 'killed',
         counts_consumption: true,
         completed_at: Time.now
       )
@@ -319,28 +455,27 @@ bot.button do |event|
     # 周回+1、段階再計算、HPリセット
     new_laps = state[:laps].to_i + 1
     new_level = level_for_laps(new_laps)
+    next_max_hp = begin
+      # 次周の段階での最大HPを計算
+      tmp = state.dup
+      tmp[:laps] = new_laps
+      tmp[:level] = new_level
+      max_hp_for(tmp)
+    end
     DB[:boss_states].where(id: state[:id]).update(
       laps: new_laps,
       level: new_level,
-      now_hp: state[:max_hp],
+      now_hp: next_max_hp,
       updated_at: Time.now
     )
 
-    # 持越しを生成（宣言状態）
-    DB[:attacks].insert(
-      year_month: current_year_month,
-      day_index: current_day_index,
-      member_id: user[:id],
-      boss_number: boss_number,
-      laps_at_start: new_laps,
-      level_at_start: new_level,
-      is_attacking: true,
-      damage: 0,
-      carry_over: true,
-      counts_consumption: false,
-      status: 'declared'
-    )
-    post_or_update_panel(event.channel.id)
+    # 次周のパネルを新規投稿
+    post_new_panel(event.channel.id)
+    # 凸状況パネルも更新
+    status_channel_id = ENV['STATUS_CHANNEL_ID']
+    if status_channel_id && !status_channel_id.strip.empty?
+      post_daily_status(status_channel_id.to_i)
+    end
   end
 
   rescue => e
@@ -350,7 +485,83 @@ end
 
 # ユーザー手動追加メソッド
 bot.message(contains: 'add_user') do |event|
-  DB[:members].insert(discord_user_id: event.user.id, discord_user_name: event.user.name, is_member: true)
+  begin
+    member = event.member
+    display = member && member.display_name ? member.display_name : event.user.name
+    DB[:members].insert(
+      discord_user_id: event.user.id,
+      discord_user_name: event.user.name,
+      display_name: display,
+      is_member: true
+    )
+    event.respond "登録したの: #{display}"
+  rescue => e
+    event.respond "登録でエラーなの: #{e.class} #{e.message}"
+  end
+end
+
+# 凸状況パネル投稿コマンド
+bot.message(contains: 'status') do |event|
+  begin
+    post_daily_status(event.channel.id)
+  rescue => e
+    event.respond "凸状況パネル投稿でエラーなの: #{e.class} #{e.message}"
+  end
+end
+
+# ボス追加コマンド: add_boss 1 ネプテリオン 2000 5000 12000
+bot.message(contains: 'add_boss') do |event|
+  begin
+    parts = event.message.content.split
+    if parts.size != 6
+      event.respond "使い方: add_boss ボス番号 ボス名 2段階HP 3段階HP 4段階HP"
+      next
+    end
+    
+    boss_number = parts[1].to_i
+    boss_name = parts[2]
+    hp_lv2 = parts[3].to_i
+    hp_lv3 = parts[4].to_i
+    hp_lv4 = parts[5].to_i
+    
+    unless (1..5).include?(boss_number)
+      event.respond "ボス番号は1〜5の範囲で指定してほしいの"
+      next
+    end
+    
+    # 当月のボスデータを更新または作成
+    existing = DB[:boss_states].where(year_month: current_year_month, boss_number: boss_number).first
+    if existing
+      DB[:boss_states].where(id: existing[:id]).update(
+        name: boss_name,
+        max_hp_lv2: hp_lv2,
+        max_hp_lv3: hp_lv3,
+        max_hp_lv4: hp_lv4,
+        now_hp: hp_lv2,  # 初期値は2段階目
+        level: 2,        # 初期値は2段階
+        laps: 1,         # 初期値は1周目
+        updated_at: Time.now
+      )
+      event.respond "ボス#{boss_number}のデータを更新したの: #{boss_name}"
+    else
+      DB[:boss_states].insert(
+        year_month: current_year_month,
+        boss_number: boss_number,
+        name: boss_name,
+        max_hp_lv2: hp_lv2,
+        max_hp_lv3: hp_lv3,
+        max_hp_lv4: hp_lv4,
+        now_hp: hp_lv2,  # 初期値は2段階目
+        level: 2,        # 初期値は2段階
+        laps: 1,         # 初期値は1周目
+        created_at: Time.now,
+        updated_at: Time.now
+      )
+      event.respond "ボス#{boss_number}のデータを作成したの: #{boss_name}"
+    end
+  rescue => e
+    event.respond "ボス追加でエラーなの: #{e.class} #{e.message}"
+  end
 end
 
 # コマンド: sync_members（ロール所持者をDBに同期）
@@ -380,6 +591,7 @@ bot.message(contains: 'sync_members') do |event|
       if existing
         DB[:members].where(id: existing[:id]).update(
           discord_user_name: m.username,
+          display_name: (m.display_name || m.username),
           is_member: true,
           updated_at: Sequel::CURRENT_TIMESTAMP
         )
@@ -387,6 +599,7 @@ bot.message(contains: 'sync_members') do |event|
         DB[:members].insert(
           discord_user_id: m.id,
           discord_user_name: m.username,
+          display_name: (m.display_name || m.username),
           is_member: true,
           created_at: Sequel::CURRENT_TIMESTAMP,
           updated_at: Sequel::CURRENT_TIMESTAMP
@@ -408,6 +621,34 @@ end
 # ユーザー取得メソッド
 def get_user(id)
   DB[:members].where(discord_user_id: id).first
+end
+
+# 起動時にパネルメッセージIDを復元
+restore_panel_messages
+
+# 定期投稿（毎朝5時）
+Thread.new do
+  loop do
+    now = jst_now
+    # 5時ちょうどに投稿
+    next_5am = Time.new(now.year, now.month, now.day, 5, 0, 0, '+09:00')
+    next_5am += 24 * 60 * 60 if next_5am <= now
+    
+    sleep_time = next_5am - now
+    sleep(sleep_time)
+    
+    begin
+      # 凸状況チャンネルID（環境変数で指定）
+      status_channel_id = ENV['STATUS_CHANNEL_ID']
+      if status_channel_id && !status_channel_id.strip.empty?
+        post_daily_status(status_channel_id.to_i)
+      else
+        puts "STATUS_CHANNEL_ID が設定されていません"
+      end
+    rescue => e
+      puts "定期投稿でエラー: #{e.class} #{e.message}"
+    end
+  end
 end
 
 bot.run
