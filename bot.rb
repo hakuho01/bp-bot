@@ -56,11 +56,20 @@ PANEL_MESSAGE_IDS = {}
 
 # パネルメッセージIDの永続化
 def save_panel_message_id(channel_id, message_id)
-  DB[:panel_messages].upsert(
-    channel_id: channel_id,
-    message_id: message_id,
-    updated_at: Time.now
-  )
+  existing = DB[:panel_messages].where(channel_id: channel_id).first
+  if existing
+    DB[:panel_messages].where(id: existing[:id]).update(
+      message_id: message_id,
+      updated_at: Time.now
+    )
+  else
+    DB[:panel_messages].insert(
+      channel_id: channel_id,
+      message_id: message_id,
+      created_at: Time.now,
+      updated_at: Time.now
+    )
+  end
 end
 
 # 起動時にパネルメッセージIDを復元
