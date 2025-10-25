@@ -497,13 +497,30 @@ bot.message(contains: 'add_user') do |event|
   begin
     # event.user から直接情報を取得
     display = event.user.display_name || event.user.username
-    DB[:members].insert(
-      discord_user_id: event.user.id,
-      discord_user_name: event.user.username,
-      display_name: display,
-      is_member: true
-    )
-    event.respond "登録したの: #{display}"
+    
+    # 既存ユーザーかチェック
+    existing = DB[:members].where(discord_user_id: event.user.id).first
+    if existing
+      # 既存ユーザーの場合は更新
+      DB[:members].where(id: existing[:id]).update(
+        discord_user_name: event.user.username,
+        display_name: display,
+        is_member: true,
+        updated_at: Time.now
+      )
+      event.respond "ユーザー情報を更新したの: #{display}"
+    else
+      # 新規ユーザーの場合は登録
+      DB[:members].insert(
+        discord_user_id: event.user.id,
+        discord_user_name: event.user.username,
+        display_name: display,
+        is_member: true,
+        created_at: Time.now,
+        updated_at: Time.now
+      )
+      event.respond "登録したの: #{display}"
+    end
   rescue => e
     event.respond "登録でエラーなの: #{e.class} #{e.message}"
   end
