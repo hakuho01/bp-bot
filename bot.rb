@@ -495,11 +495,11 @@ end
 # ユーザー手動追加メソッド
 bot.message(contains: 'add_user') do |event|
   begin
-    member = event.member
-    display = member && member.display_name ? member.display_name : event.user.name
+    # event.user から直接情報を取得
+    display = event.user.display_name || event.user.username
     DB[:members].insert(
       discord_user_id: event.user.id,
-      discord_user_name: event.user.name,
+      discord_user_name: event.user.username,
       display_name: display,
       is_member: true
     )
